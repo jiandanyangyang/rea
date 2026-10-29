@@ -163,7 +163,7 @@ it("rejects repeated deeply nested container keys promptly", () => {
     inspectSolidityMetadata(bytecode("a2" + key + "01" + key + "02")),
   ).toMatchObject({
     status: "not-decoded",
-    diagnostic: expect.stringContaining("found repeat map key"),
+    diagnostic: "repeated_map_key",
   });
   expect(performance.now() - started).toBeLessThan(1000);
 });

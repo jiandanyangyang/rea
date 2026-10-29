@@ -70,7 +70,10 @@ it("closes the descriptor and retains staged content when its final identity is 
     expect(result.error.cause).toMatchObject({
       outcome: {
         ok: false,
-        error: { message: "Cannot verify staged file identity" },
+        error: {
+          _tag: "StagedOutputError",
+          code: "identity_unverified",
+        },
       },
     });
     const stage = result.error.cleanupResources[0];
@@ -457,7 +460,11 @@ it("refuses to remove unexpected files from an owned staging directory", async (
   const unexpected = join(directory, "unexpected");
   writeFileSync(unexpected, "unowned");
   try {
-    await expect(owner.close()).rejects.toThrow(/Unexpected staging entries/u);
+    await expect(owner.close()).rejects.toMatchObject({
+      _tag: "StagedOutputError",
+      code: "unexpected_entries",
+      detail: { count: 1, entries: "unexpected" },
+    });
     expect(await fs.readFile(unexpected, "utf8")).toBe("unowned");
   } finally {
     await fs.rm(unexpected, { force: true });

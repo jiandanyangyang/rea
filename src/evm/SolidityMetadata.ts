@@ -1,3 +1,4 @@
+import { EvmAdmissionError } from "./EvmAdmissionError.js";
 import { decode, Tokenizer, Type, type Token } from "cborg";
 import type {
   SolidityMetadata,
@@ -32,18 +33,14 @@ class BoundedMetadataTokenizer extends Tokenizer {
       Type.equals(token.type, Type.tag) ||
       Type.equals(token.type, Type.float)
     )
-      throw new Error(
-        "CBOR tags and floating-point values are outside this metadata profile.",
-      );
+      throw new EvmAdmissionError("tag_or_float");
     if (Type.equals(token.type, Type.string)) {
       if (token.byteValue !== undefined)
         token.value = utf8.decode(token.byteValue);
       // cborg answers the shortest-form empty text (0x60) with a shared token that has no
       // bytes; it can only mean "", which is already its value.
       else if (token.value !== "" || token.encodedLength !== 1)
-        throw new Error(
-          "CBOR text bytes were unavailable for strict UTF-8 validation.",
-        );
+        throw new EvmAdmissionError("text_bytes_unavailable");
     }
     const parent = this.remaining.length - 1;
     if (parent >= 0) this.remaining[parent]!--;
@@ -61,11 +58,11 @@ class BoundedMetadataTokenizer extends Tokenizer {
         children < 0 ||
         children > this.data.length
       )
-        throw new Error(
-          "Declared CBOR collection exceeds the encoded item-byte bound.",
-        );
+        throw new EvmAdmissionError("collection_exceeds_bound");
       if (this.remaining.length >= MAX_DEPTH)
-        throw new Error("CBOR nesting exceeds the 64-level metadata profile.");
+        throw new EvmAdmissionError("nesting_exceeds_profile", {
+          max_depth: MAX_DEPTH,
+        });
       this.remaining.push(children);
     }
     return token;
@@ -85,9 +82,7 @@ const scalar = (value: unknown): SolidityMetadataScalar => {
   if (value instanceof Map) return { kind: "uninterpreted", container: "map" };
   if (Array.isArray(value))
     return { kind: "uninterpreted", container: "array" };
-  throw new Error(
-    "CBOR decoder returned a value outside the admitted profile.",
-  );
+  throw new EvmAdmissionError("value_outside_profile");
 };
 
 /** Value identity for duplicate-key checks; map entry order is not significant. */
@@ -108,7 +103,12 @@ const validateMapKeys = (value: unknown): void => {
     for (const [key, item] of value) {
       const identity = keyIdentity(key);
       if (seen.has(identity))
-        throw new Error(`CBOR decode error: found repeat map key ${identity}`);
+        throw new EvmAdmissionError(
+          "repeated_map_key",
+          identity.length <= 128
+            ? { key: identity }
+            : { key_length: identity.length },
+        );
       seen.add(identity);
       validateMapKeys(key);
       validateMapKeys(item);
@@ -148,8 +148,7 @@ export const inspectSolidityMetadata = (
       ...decodeOptions,
       tokenizer: new BoundedMetadataTokenizer(selected),
     });
-    if (!(raw instanceof Map))
-      throw new Error("Terminal CBOR candidate did not decode to a root map.");
+    if (!(raw instanceof Map)) throw new EvmAdmissionError("root_not_map");
     validateMapKeys(raw);
     // cborg compares Map keys by identity, so repeated byte-string or container
     // keys (each its own object) pass its duplicate check; compare by value at
@@ -185,9 +184,11 @@ export const inspectSolidityMetadata = (
       status: "not-decoded",
       entries: [],
       compiler_version: null,
-      diagnostic: (cause instanceof Error
-        ? cause.message
-        : String(cause)
+      diagnostic: (cause instanceof EvmAdmissionError
+        ? cause.code
+        : cause instanceof Error
+          ? cause.message
+          : String(cause)
       ).slice(0, 512),
     };
   }
