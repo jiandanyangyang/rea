@@ -1,0 +1,210 @@
+# 自动同步上游仓库 morluto/rea
+# - 同步全部分支、标签（与上游保持一致）
+# - 同步全部 Releases（含附件资产）
+# - 本工作流文件会在上游同步后自动保留在默认分支上
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # 每 6 小时（UTC 0/6/12/18 点）
+  workflow_dispatch: # 支持手动触发
+    inputs:
+      sync_releases:
+        description: '是否同步 Releases（含附件）'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+# 注意：内置 GITHUB_TOKEN 无法修改 .github/workflows 下的文件（GitHub 安全限制）。
+# 因此代码/标签推送与 Release 同步均使用 PAT（classic 需勾选 repo + workflow，
+# 或 fine-grained 授予 Contents 与 Workflows 的读写权限），存为 Secret: SYNC_PAT。
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 同步代码：分支 + 标签
+  # ---------------------------------------------------------------------------
+  sync-code:
+    name: Sync branches & tags
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }} # 用 PAT 才能推送含 workflow 文件的分支
+
+      - name: Sync from upstream
+        env:
+          UPSTREAM_URL: https://github.com/morluto/rea.git
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 本工作流文件需要在强制同步后保留，先备份
+          mkdir -p /tmp/keep
+          cp .github/workflows/sync-upstream.yml /tmp/keep/sync-upstream.yml
+
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream --tags --prune --force
+
+          # 上游分支/标签清单（用 ls-remote 保证准确）
+          git ls-remote --heads upstream | awk '{print $2}' | sed 's#refs/heads/##' | sort -u > /tmp/upstream_branches
+          git ls-remote --tags  upstream | awk '{print $2}' | sed 's#refs/tags/##; s#\^{}##' | sort -u > /tmp/upstream_tags
+          git ls-remote --heads origin   | awk '{print $2}' | sed 's#refs/heads/##' | sort -u > /tmp/origin_branches
+          git ls-remote --tags  origin   | awk '{print $2}' | sed 's#refs/tags/##; s#\^{}##' | sort -u > /tmp/origin_tags
+
+          # 1) 强制同步上游全部分支
+          while IFS= read -r b; do
+            echo ">> sync branch: $b"
+            git push origin "refs/remotes/upstream/$b:refs/heads/$b" --force
+          done < /tmp/upstream_branches
+
+          # 2) 强制同步上游全部标签
+          while IFS= read -r t; do
+            echo ">> sync tag: $t"
+            git push origin "refs/tags/$t:refs/tags/$t" --force
+          done < /tmp/upstream_tags
+
+          # 3) 删除 fork 中上游已不存在的分支（默认分支除外）
+          DEFAULT_BRANCH="${GITHUB_REF_NAME}"
+          while IFS= read -r b; do
+            if [ "$b" != "$DEFAULT_BRANCH" ]; then
+              echo ">> delete stale branch: $b"
+              git push origin --delete "$b" || true
+            fi
+          done < <(comm -23 /tmp/origin_branches /tmp/upstream_branches)
+
+          # 4) 删除 fork 中上游已不存在的标签
+          while IFS= read -r t; do
+            echo ">> delete stale tag: $t"
+            git push origin --delete "refs/tags/$t" || true
+          done < <(comm -23 /tmp/origin_tags /tmp/upstream_tags)
+
+          # 5) 默认分支 = 上游最新 + 保留本工作流文件
+          git checkout -B "$DEFAULT_BRANCH" "upstream/$DEFAULT_BRANCH"
+          mkdir -p .github/workflows
+          cp /tmp/keep/sync-upstream.yml .github/workflows/sync-upstream.yml
+          if ! git diff --quiet -- .github/workflows/sync-upstream.yml || ! git ls-files --error-unmatch .github/workflows/sync-upstream.yml >/dev/null 2>&1; then
+            git add .github/workflows/sync-upstream.yml
+            git commit -m "chore: keep upstream sync workflow"
+            git push origin "HEAD:$DEFAULT_BRANCH"
+            echo ">> workflow file restored on $DEFAULT_BRANCH"
+          else
+            echo ">> workflow file already present, nothing to restore"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # 同步 Releases（含附件资产）
+  # ---------------------------------------------------------------------------
+  sync-releases:
+    name: Sync releases
+    needs: sync-code
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.sync_releases }}
+    steps:
+      - name: Sync releases & assets
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          UPSTREAM_REPO: morluto/rea
+          DEST_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          API="https://api.github.com"
+          UPLOAD="https://uploads.github.com"
+          AUTH=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+
+          # 分页拉取全部 release（每行一个 JSON 对象）
+          fetch_all() {
+            local repo="$1" out="$2" page=1 count
+            : > "$out"
+            while :; do
+              curl -sS "${AUTH[@]}" "$API/repos/$repo/releases?per_page=100&page=$page" > /tmp/page.json
+              count=$(jq 'length' /tmp/page.json)
+              [ "$count" -eq 0 ] && break
+              jq -c '.[]' /tmp/page.json >> "$out"
+              page=$((page + 1))
+            done
+          }
+
+          fetch_all "$UPSTREAM_REPO" /tmp/upstream_releases.json
+          fetch_all "$DEST_REPO"     /tmp/local_releases.json
+
+          echo "Upstream releases: $(wc -l < /tmp/upstream_releases.json)"
+          echo "Local releases:    $(wc -l < /tmp/local_releases.json)"
+
+          # 从旧到新处理（API 默认从新到旧，tac 反转）
+          while IFS= read -r rel; do
+            tag=$(jq -r '.tag_name'  <<< "$rel")
+            name=$(jq -r '.name'     <<< "$rel")
+            body=$(jq -r '.body // ""' <<< "$rel")
+            prerelease=$(jq -r '.prerelease' <<< "$rel")
+            target=$(jq -r '.target_commitish' <<< "$rel")
+
+            payload=$(jq -n \
+              --arg tag "$tag" --arg name "$name" --arg body "$body" \
+              --arg target "$target" --argjson prerelease "$prerelease" \
+              '{tag_name:$tag, name:$name, body:$body, prerelease:$prerelease, target_commitish:$target}')
+
+            local_rel=$(jq -c --arg tag "$tag" 'select(.tag_name==$tag)' /tmp/local_releases.json | head -n1 || true)
+
+            if [ -z "$local_rel" ]; then
+              # ---- 本地不存在：创建 release ----
+              echo ">> creating release: $tag"
+              created=$(curl -sS -X POST "${AUTH[@]}" -d "$payload" "$API/repos/$DEST_REPO/releases")
+              rid=$(jq -r '.id' <<< "$created")
+              if [ -z "$rid" ] || [ "$rid" = "null" ]; then
+                echo "::error::failed to create release $tag"; echo "$created"; exit 1
+              fi
+            else
+              # ---- 已存在：必要时更新元数据 ----
+              rid=$(jq -r '.id' <<< "$local_rel")
+              lname=$(jq -r '.name' <<< "$local_rel")
+              lbody=$(jq -r '.body // ""' <<< "$local_rel")
+              lpre=$(jq -r '.prerelease' <<< "$local_rel")
+              if [ "$lname" != "$name" ] || [ "$lbody" != "$body" ] || [ "$lpre" != "$prerelease" ]; then
+                echo ">> updating release metadata: $tag"
+                curl -sS -X PATCH "${AUTH[@]}" -d "$payload" "$API/repos/$DEST_REPO/releases/$rid" > /dev/null
+              else
+                echo ">> release up to date: $tag"
+              fi
+            fi
+
+            # ---- 同步附件资产（缺失则下载后上传）----
+            asset_count=$(jq '.assets | length' <<< "$rel")
+            if [ "$asset_count" -gt 0 ]; then
+              mkdir -p /tmp/assets && rm -rf /tmp/assets/*
+              local_assets=$(jq -r '.assets[].name' <<< "${local_rel:-null}" 2>/dev/null || true)
+
+              for ((i=0; i<asset_count; i++)); do
+                aname=$(jq -r ".assets[$i].name" <<< "$rel")
+                aid=$(jq -r ".assets[$i].id" <<< "$rel")
+
+                if echo "$local_assets" | grep -qxF "$aname"; then
+                  echo "   asset exists: $aname"
+                  continue
+                fi
+
+                echo "   downloading asset: $aname"
+                curl -sSL "${AUTH[@]}" -H "Accept: application/octet-stream" \
+                  -o "/tmp/assets/$aname" "$API/repos/$UPSTREAM_REPO/releases/assets/$aid"
+
+                echo "   uploading asset: $aname"
+                enc_name=$(jq -rn --arg n "$aname" '$n|@uri')
+                curl -sS -X POST "${AUTH[@]}" -H "Content-Type: application/octet-stream" \
+                  --data-binary "@/tmp/assets/$aname" \
+                  "$UPLOAD/repos/$DEST_REPO/releases/$rid/assets?name=$enc_name" > /dev/null
+                rm -f "/tmp/assets/$aname"
+              done
+            fi
+          done < <(tac /tmp/upstream_releases.json)
+
+          echo "All releases synced."
