@@ -525,6 +525,7 @@ export class EvmoleInterfaceProvider implements EvmInterfacePort {
           selectedLimiter.error.reason,
           {
             cause: selectedLimiter.error.cause,
+            diagnostics: selectedLimiter.error.diagnostics,
             userMessage: selectedLimiter.error.reason,
           },
         );
